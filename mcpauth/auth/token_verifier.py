@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional, Union
 
 import jwt
 from ..config import AuthServerConfig
@@ -7,6 +7,7 @@ from ..exceptions import (
     BearerAuthExceptionCode,
     MCPAuthAuthServerException,
     MCPAuthBearerAuthException,
+    MCPAuthBearerAuthExceptionDetails,
     MCPAuthTokenVerificationException,
     MCPAuthTokenVerificationExceptionCode,
 )
@@ -20,9 +21,12 @@ class TokenVerifier:
     or a legacy `server` configuration.
     """
 
-    def __init__(self, auth_servers: List[AuthServerConfig]):
+    def __init__(
+        self, auth_servers: List[AuthServerConfig], resource: Optional[str] = None
+    ):
         self._auth_servers = auth_servers
         self._issuers = {server.metadata.issuer for server in auth_servers}
+        self._resource = resource
 
     def _get_unverified_jwt_issuer(self, token: str) -> str:
         try:
@@ -64,6 +68,25 @@ class TokenVerifier:
                 ),
             )
 
+    def validate_jwt_audience(self, audience: Optional[Union[str, List[str]]]):
+        """
+        Ensures the token's `aud` claim identifies this resource. `aud` may be a single
+        string or a list of strings per RFC 7519; either form is accepted as long as it
+        contains this resource's identifier.
+        """
+        is_valid = (
+            audience == self._resource
+            if isinstance(audience, str)
+            else isinstance(audience, list) and self._resource in audience
+        )
+        if not is_valid:
+            raise MCPAuthBearerAuthException(
+                BearerAuthExceptionCode.INVALID_AUDIENCE,
+                cause=MCPAuthBearerAuthExceptionDetails(
+                    expected=self._resource, actual=audience
+                ),
+            )
+
     def create_verify_jwt_function(
         self, leeway: float = 60
     ) -> VerifyAccessTokenFunction:
@@ -83,6 +106,12 @@ class TokenVerifier:
                 )
 
             verify_function = create_verify_jwt(jwks_uri, leeway=leeway)
-            return verify_function(token)
+            auth_info = verify_function(token)
+
+            if self._resource is not None:
+                self.validate_jwt_issuer(auth_info.issuer)
+                self.validate_jwt_audience(auth_info.audience)
+
+            return auth_info
 
         return verify_jwt 

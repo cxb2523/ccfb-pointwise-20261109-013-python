@@ -16,6 +16,7 @@ from mcpauth.exceptions import (
     AuthServerExceptionCode,
     MCPAuthAuthServerException,
 )
+from mcpauth.types import AuthInfo
 
 
 @pytest.fixture
@@ -149,4 +150,141 @@ def test_create_verify_jwt_function_no_jwks_uri(
     with pytest.raises(MCPAuthAuthServerException) as excinfo:
         verify_jwt_func(token)
     assert excinfo.value.code == AuthServerExceptionCode.MISSING_JWKS_URI
-    mock_create_verify_jwt.assert_not_called() 
+    mock_create_verify_jwt.assert_not_called()
+
+
+def _make_auth_info(issuer: str, audience) -> AuthInfo:
+    return AuthInfo(
+        token="token",
+        issuer=issuer,
+        subject="1234567890",
+        audience=audience,
+        scopes=[],
+        claims={"iss": issuer, "sub": "1234567890", "aud": audience},
+    )
+
+
+# --- Resource-bound audience/issuer enforcement (cross-resource token reuse) ---
+
+
+@patch("mcpauth.auth.token_verifier.create_verify_jwt")
+def test_create_verify_jwt_function_audience_string_mismatch(
+    mock_create_verify_jwt: Mock, mock_auth_server_config: AuthServerConfig
+):
+    """A token whose `aud` (string) points at a different resource must be rejected."""
+    mock_create_verify_jwt.return_value = Mock(
+        return_value=_make_auth_info(
+            issuer="https://auth.example.com", audience="https://other-api.com"
+        )
+    )
+
+    verifier = TokenVerifier(
+        auth_servers=[mock_auth_server_config], resource="https://my-api.com"
+    )
+    verify_jwt_func = verifier.create_verify_jwt_function()
+    token = create_test_jwt(issuer="https://auth.example.com")
+
+    with pytest.raises(MCPAuthBearerAuthException) as excinfo:
+        verify_jwt_func(token)
+    assert excinfo.value.code == BearerAuthExceptionCode.INVALID_AUDIENCE
+
+
+@patch("mcpauth.auth.token_verifier.create_verify_jwt")
+def test_create_verify_jwt_function_issuer_mismatch_post_verification(
+    mock_create_verify_jwt: Mock, mock_auth_server_config: AuthServerConfig
+):
+    """
+    Defense in depth: even if the decoded payload's `iss` does not match any trusted
+    authorization server for this resource, the request must be rejected.
+    """
+    mock_create_verify_jwt.return_value = Mock(
+        return_value=_make_auth_info(
+            issuer="https://attacker-issuer.com", audience="https://my-api.com"
+        )
+    )
+
+    verifier = TokenVerifier(
+        auth_servers=[mock_auth_server_config], resource="https://my-api.com"
+    )
+    verify_jwt_func = verifier.create_verify_jwt_function()
+    # The unverified `iss` used for JWKS lookup still points at the trusted server,
+    # but the verified payload claims a different issuer.
+    token = create_test_jwt(issuer="https://auth.example.com")
+
+    with pytest.raises(MCPAuthBearerAuthException) as excinfo:
+        verify_jwt_func(token)
+    assert excinfo.value.code == BearerAuthExceptionCode.INVALID_ISSUER
+
+
+@patch("mcpauth.auth.token_verifier.create_verify_jwt")
+def test_create_verify_jwt_function_audience_array_hit(
+    mock_create_verify_jwt: Mock, mock_auth_server_config: AuthServerConfig
+):
+    """An `aud` array that includes this resource among several audiences must pass."""
+    mock_create_verify_jwt.return_value = Mock(
+        return_value=_make_auth_info(
+            issuer="https://auth.example.com",
+            audience=["https://other-api.com", "https://my-api.com"],
+        )
+    )
+
+    verifier = TokenVerifier(
+        auth_servers=[mock_auth_server_config], resource="https://my-api.com"
+    )
+    verify_jwt_func = verifier.create_verify_jwt_function()
+    token = create_test_jwt(issuer="https://auth.example.com")
+
+    auth_info = verify_jwt_func(token)
+    assert auth_info.audience == ["https://other-api.com", "https://my-api.com"]
+
+
+@patch("mcpauth.auth.token_verifier.create_verify_jwt")
+def test_create_verify_jwt_function_audience_array_miss(
+    mock_create_verify_jwt: Mock, mock_auth_server_config: AuthServerConfig
+):
+    """An `aud` array that never includes this resource must be rejected."""
+    mock_create_verify_jwt.return_value = Mock(
+        return_value=_make_auth_info(
+            issuer="https://auth.example.com",
+            audience=["https://other-api.com", "https://another-api.com"],
+        )
+    )
+
+    verifier = TokenVerifier(
+        auth_servers=[mock_auth_server_config], resource="https://my-api.com"
+    )
+    verify_jwt_func = verifier.create_verify_jwt_function()
+    token = create_test_jwt(issuer="https://auth.example.com")
+
+    with pytest.raises(MCPAuthBearerAuthException) as excinfo:
+        verify_jwt_func(token)
+    assert excinfo.value.code == BearerAuthExceptionCode.INVALID_AUDIENCE
+
+
+@patch("mcpauth.auth.token_verifier.create_verify_jwt")
+def test_create_verify_jwt_function_audience_string_match(
+    mock_create_verify_jwt: Mock, mock_auth_server_config: AuthServerConfig
+):
+    """Sanity check: a matching string `aud` for the configured resource is accepted."""
+    mock_create_verify_jwt.return_value = Mock(
+        return_value=_make_auth_info(
+            issuer="https://auth.example.com", audience="https://my-api.com"
+        )
+    )
+
+    verifier = TokenVerifier(
+        auth_servers=[mock_auth_server_config], resource="https://my-api.com"
+    )
+    verify_jwt_func = verifier.create_verify_jwt_function()
+    token = create_test_jwt(issuer="https://auth.example.com")
+
+    auth_info = verify_jwt_func(token)
+    assert auth_info.audience == "https://my-api.com"
+
+
+def test_validate_jwt_audience_no_resource_configured_skips_check(
+    mock_auth_server_config: AuthServerConfig,
+):
+    """Legacy `server` mode has no resource identity, so no audience is enforced."""
+    verifier = TokenVerifier(auth_servers=[mock_auth_server_config])
+    assert verifier._resource is None  # type: ignore[reportProtectedUsage] 

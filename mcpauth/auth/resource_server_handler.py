@@ -45,7 +45,9 @@ class ResourceServerHandler(MCPAuthHandler):
         for resource_config in self._resources_configs:
             resource = resource_config.metadata.resource
             auth_servers = resource_config.metadata.authorization_servers or []
-            self._token_verifiers[resource] = TokenVerifier(auth_servers)
+            self._token_verifiers[resource] = TokenVerifier(
+                auth_servers, resource=resource
+            )
 
     def create_metadata_route(self) -> Router:
         routes: List[Route] = []
